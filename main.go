@@ -6,11 +6,12 @@ import (
 	"path"
 )
 
-// Unused.
+var trashdir string
+
 func main() {}
 
 // See https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html.
-func trashdir() string {
+func init() {
 	datahome := os.Getenv("XDG_DATA_HOME")
 	if datahome == "" {
 		homedir, err := os.UserHomeDir()
@@ -19,12 +20,11 @@ func trashdir() string {
 		}
 		datahome = path.Join(homedir, ".local/share")
 	}
-	trashdir := path.Join(datahome, "Trash/files")
-	return trashdir
+	trashdir = path.Join(datahome, "Trash/files")
 }
 
 func saferm(pathname string) C.int {
-	newpath := path.Join(trashdir(), path.Base(pathname))
+	newpath := path.Join(trashdir, path.Base(pathname))
 	os.Rename(pathname, newpath)
 	return 0
 }
