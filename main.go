@@ -3,9 +3,12 @@ package main
 import (
 	"C"
 	"github.com/pkg/errors"
+	"golang.org/x/sys/unix"
+	"io"
 	"log"
 	"os"
 	"path"
+	"syscall"
 )
 
 var trashdir string
@@ -27,13 +30,13 @@ func init() {
 func directoryError(err error) {
 	if os.IsNotExist(err) {
 		errinfo := errors.Wrap(err, "User's trash directory does not exist")
-		logger.Fatalf("%v", errinfo)
+		logger.Fatal(errinfo)
 	}
 	if os.IsPermission(err) {
 		errinfo := errors.Wrap(err, "User's trash directory is not accessible")
-		logger.Fatalf("%v", errinfo)
+		logger.Fatal(errinfo)
 	}
-	logger.Fatalf("%v", err)
+	logger.Fatal(err)
 }
 
 func TrashDir() string {
@@ -51,27 +54,79 @@ func TrashDir() string {
 	return trashdir
 }
 
-func SafeRemove(pathname string) C.int {
-	newpath := path.Join(trashdir, path.Base(pathname))
-	// TODO: Check for file collisions?
-	err := os.Rename(pathname, newpath)
-	if err != nil {
-		directoryError(err)
-	}
-	return 0
+func SameDevice(a os.FileInfo, b os.FileInfo) bool {
+	a_dev := a.Sys().(*syscall.Stat_t).Dev
+	b_dev := b.Sys().(*syscall.Stat_t).Dev
+
+	return a_dev == b_dev
 }
 
-//export remove
-func remove(pathname *C.char) C.int {
-	return SafeRemove(C.GoString(pathname))
+func SafeRemove(dirfd int, pathname string, flags int) error {
+	o_flags := unix.O_RDONLY | unix.O_NONBLOCK | unix.O_CLOEXEC
+	pathfd, err := unix.Openat(dirfd, pathname, o_flags, 0)
+	if err != nil {
+		return err
+	}
+	// Create a Go File from the file descriptor obtained earlier.
+	srcfile := os.NewFile(uintptr(pathfd), pathname)
+
+	srcstat, err := srcfile.Stat()
+	if err != nil {
+		return err
+	}
+
+	deststat, err := os.Stat(trashdir)
+	if err != nil {
+		return err
+	}
+
+	dest := path.Join(trashdir, path.Base(pathname))
+
+	// Compare source and destination devices to see if they are the same.
+	// If they are, it's a cheap and simple operation. If not, we have to copy everything.
+	if SameDevice(srcstat, deststat) {
+		err := unix.Renameat(dirfd, pathname, unix.AT_FDCWD, dest)
+		if err != nil {
+			return err
+		}
+	} else {
+		var err error
+
+		destfile, err := os.Create(dest)
+		if err != nil {
+			return err
+		}
+		defer destfile.Close()
+
+		_, err = io.Copy(destfile, srcfile)
+		if err != nil {
+			return err
+		}
+
+		// The SameDevice == true branch 'removes' the path
+		// as a side effect. We should do the same in this branch.
+		err = unix.Unlinkat(dirfd, pathname, flags)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 //export unlinkat
-func unlinkat(_ C.int, pathname *C.char, _ int) C.int {
-	return SafeRemove(C.GoString(pathname))
-}
+func unlinkat(dirfd C.int, pathname *C.char, flags int) C.int {
+	if flags&unix.AT_REMOVEDIR != unix.AT_REMOVEDIR {
+		err := SafeRemove(int(dirfd), C.GoString(pathname), flags)
+		if err != nil {
+			logger.Fatal(err)
+		}
+	} else {
+		err := unix.Unlinkat(int(dirfd), C.GoString(pathname), flags)
+		if err != nil {
+			logger.Fatal(err)
+		}
+	}
 
-//export rmdir
-func rmdir(pathname *C.char) C.int {
-	return SafeRemove(C.GoString(pathname))
+	return 0
 }
